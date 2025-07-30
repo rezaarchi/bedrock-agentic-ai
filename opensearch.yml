@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Serverless RAG Q&A application using Knowledge Base , Agents, Opensearch Serverless'
+
+Parameters:
+  AOSSCollectionName:
+    Default: rag-sagemaker-kb
+    Type: String
+    Description: Name of the Amazon OpenSearch Service Serverless (AOSS) collection.
+    MinLength: 1
+    MaxLength: 21
+    AllowedPattern: ^[a-z0-9](-*[a-z0-9])*
+    ConstraintDescription: Must be lowercase or numbers with a length of 1-63 characters.
+  AOSSIndexName:
+    Default: rag-sagemaker-readthedocs-io
+    Type: String
+    Description: Name of the vector index in the Amazon OpenSearch Service Serverless (AOSS) collection.
+
+Resources:
+         
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Description: Creating Amazon S3 bucket to hold source data for knowledge base
+    Properties:
+      BucketName: !Join
+      - '-'
+      - - !Ref AOSSCollectionName
+        - !Sub ${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  cleanupBucketOnDelete:
+    Type: Custom::cleanupbucket
+    Properties:
+      ServiceToken: !GetAtt 'DeleteS3Bucket.Arn'
+      BucketName: !Ref S3Bucket
+    DependsOn: S3Bucket
+
+  AmazonBedrockExecutionRoleForKnowledgeBase:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+      - '-'
+      - - AmazonBedrockExecutionRoleForKnowledgeBase
+        - !Ref AOSSCollectionName
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              "aws:SourceAccount": !Sub "${AWS::AccountId}"
+            ArnLike:
+              "AWS:SourceArn": !Sub "arn:aws-us-gov:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Path: /
+      Policies:
+        - PolicyName: S3ReadOnlyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                  - s3:Describe*
+                  - s3-object-lambda:Get*
+                  - s3-object-lambda:List*
+                Resource:
+                  - arn:aws-us-gov:s3:::aws-blogs-artifacts-public/*
+                  - !Sub arn:aws-us-gov:s3:::${S3Bucket}
+                  - !Sub arn:aws-us-gov:s3:::${S3Bucket}/*
+        - PolicyName: AOSSAPIAccessAll
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub arn:aws-us-gov:aoss:${AWS::Region}:${AWS::AccountId}:collection/*
+        - PolicyName: BedrockListAndInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateKnowledgeBase
+                  - bedrock:CreateDataSource
+                  - bedrock:CreateAgent
+                  - bedrock:CreateAgentActionGroup
+                  - bedrock:CreateAgentAlias
+                  - bedrock:PrepareAgent
+                  - bedrock:StartIngestionJob
+                  - bedrock:GetIngestionJob
+                  - bedrock:GetAgent
+                  - bedrock:GetKnowledgeBase
+                  - bedrock:GetDataSource
+                  - bedrock:ListFoundationModels
+                  - bedrock:ListCustomModels
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub arn:aws-us-gov:bedrock:${AWS::Region}::foundation-model/*
+
+  DeleteS3Bucket:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Delete all objects in S3 bucket"
+      Timeout: 30
+      Role: !GetAtt 'LambdaBasicExecutionRole.Arn'
+      Runtime: python3.13
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3Bucket
+      Code:
+        ZipFile: |
+          import json, boto3, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("event: {}".format(event))
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket)
+                      for obj in bucket.objects.filter():
+                          logger.info("delete obj: {}".format(obj))
+                          s3.Object(bucket.name, obj.key).delete()
+
+                  sendResponseCfn(event, context, cfnresponse.SUCCESS)
+              except Exception as e:
+                  logger.info("Exception: {}".format(e))
+                  sendResponseCfn(event, context, cfnresponse.FAILED)
+
+          def sendResponseCfn(event, context, responseStatus):
+              responseData = {}
+              responseData['Data'] = {}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")   
+
+  CustomSGResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt 'CustomFunctionCopyContentsToS3Bucket.Arn'
+
+
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws-us-gov:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - arn:aws-us-gov:s3:::change-accordingly/*
+                  - !Sub arn:aws-us-gov:s3:::${S3Bucket}/*
+
+  CustomFunctionCopyContentsToS3Bucket:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Uploads the Landing Zone Accelerator PDF from the external bucket to the target bucket"
+      Timeout: 30
+      Role: !GetAtt 'LambdaBasicExecutionRole.Arn'
+      Runtime: python3.13
+      Environment:
+        Variables:
+          AOSS_COLLECTION_NAME: !Ref AOSSCollectionName
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              if event['RequestType'] == 'Delete':
+                  logger.info("Delete request detected - skipping upload.")
+                  response = dict(files_uploaded=0, error=None)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+                  return
+
+              try:
+                  # S3 clients
+                  s3 = boto3.resource('s3')
+                  s3_client = boto3.client('s3')
+                  sts = boto3.client('sts')
+
+                  # Source S3 bucket and object
+                  source_bucket = 'change-accordingly'
+                  source_key = 'landing-zone-accelerator-on-aws.pdf'
+
+                  # Destination S3 bucket
+                  account_id = sts.get_caller_identity()['Account']
+                  dest_bucket_name = f"{os.environ.get('AOSS_COLLECTION_NAME')}-{account_id}"
+
+                  logger.info(f"Copying {source_bucket}/{source_key} to {dest_bucket_name}/{source_key}")
+
+                  copy_source = {'Bucket': source_bucket, 'Key': source_key}
+                  dest_bucket = s3.Bucket(dest_bucket_name)
+
+                  dest_bucket.copy(copy_source, source_key)
+
+                  logger.info(f"File copied successfully to {dest_bucket_name}/{source_key}")
+                  response = dict(files_uploaded=1, error=None)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+
+              except Exception as e:
+                  logger.error(f"Error copying file: {str(e)}")
+                  response = dict(files_uploaded=0, error=str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response)
+
+  DataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Description: Custom data access policy created by Amazon Bedrock Knowledge Base service to allow a created IAM role to have permissions on Amazon Open Search collections and indexes.
+    Properties:
+      Name: !Join
+      - '-'
+      - - !Ref AOSSCollectionName
+        - access-policy
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Description": "Access policy for Bedrock knowledge base and Lambda index creation",
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": [
+                  "collection/${AOSSCollectionName}"
+                ],
+                "Permission": [
+                  "aoss:DescribeCollectionItems",
+                  "aoss:CreateCollectionItems",
+                  "aoss:UpdateCollectionItems"
+                ]
+              },
+              {
+                "ResourceType": "index",
+                "Resource": [
+                  "index/${AOSSCollectionName}/*"
+                ],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:DeleteIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument"
+                ]
+              }
+            ],
+            "Principal": [
+              "${AmazonBedrockExecutionRoleForKnowledgeBase.Arn}",
+              "arn:aws-us-gov:iam::${AWS::AccountId}:root" 
+            ]
+          }
+        ]
+
+  NetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Join
+      - '-'
+      - - !Ref AOSSCollectionName
+        - network-policy
+      Type: network
+      Description: Network policy for AOSS collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${AOSSCollectionName}"]}, {"ResourceType":"dashboard","Resource":["collection/${AOSSCollectionName}"]}],"AllowFromPublic":true}]
+
+  EncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Join
+      - '-'
+      - - !Ref AOSSCollectionName
+        - security-policy
+      Type: encryption
+      Description: Encryption policy for AOSS collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${AOSSCollectionName}"]}],"AWSOwnedKey":true}
+
+  Collection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    Properties:
+      Name: !Ref AOSSCollectionName
+      Type: VECTORSEARCH
+      Description: Collection to holds vector search data
+    DependsOn: EncryptionPolicy
+
+  OpenSearchServerlessIndex:
+    Type: AWS::OpenSearchServerless::Index
+    Properties:
+      CollectionEndpoint: !GetAtt Collection.CollectionEndpoint
+      IndexName: !Ref AOSSIndexName
+      Mappings:
+        Properties:
+          vector:
+            Dimension: 1024
+            Index: true
+            Method:
+              Engine: faiss
+              Name: hnsw
+              Parameters: 
+                EfConstruction: 512
+                M: 16
+            Type: knn_vector
+            Value: bedrock-knowledge-base-default-vector
+
+Outputs:
+  S3Bucket:
+    Value: !GetAtt S3Bucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketArn"
+  S3BucketName:
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketName"
+  DashboardURL:
+    Value: !GetAtt Collection.DashboardEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-DashboardURL"
+  AmazonBedrockExecutionRoleForKnowledgeBase:
+    Value: !GetAtt AmazonBedrockExecutionRoleForKnowledgeBase.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BedrockExecutionRoleArn"
+  CollectionARN:
+    Value: !GetAtt Collection.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CollectionARN"
+  FilesCopied:
+    Description: Files copied
+    Value: !GetAtt 'CustomSGResource.files_uploaded'
+    Export:
+      Name: !Sub "${AWS::StackName}-FilesCopied"
+  FileCopyError:
+    Description: Files copy error
+    Value: !GetAtt 'CustomSGResource.error'
+    Export:
+      Name: !Sub "${AWS::StackName}-FileCopyError"
+  AOSSVectorIndexName:
+    Description: vector index
+    Value: !Ref AOSSIndexName
+    Export:
+      Name: !Sub "${AWS::StackName}-AOSSVectorIndexName"
+  Region:
+    Description: Deployed Region
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"

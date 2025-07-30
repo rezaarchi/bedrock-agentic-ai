@@ -1,0 +1,1657 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Serverless RAG Q&A application using Knowledge Base, Agents, and OpenSearch Serverless with VPC/EC2 Lambda Action Groups'
+
+Metadata:
+  Author: "Reza Beykzadeh"
+
+Parameters:
+  KnowledgeBaseName:
+    Default: rag-sagemaker-kb
+    Type: String
+    Description: The name of the knowledge base.
+  KnowledgeBaseDescription:
+    Default: Answer based only on information contained in the knowledge base.
+    Type: String
+    Description: The description of the knowledge base.
+  AgentName:
+    Default: rag-sagemaker-agent
+    Type: String
+    Description: The name of the agent.
+
+Resources:
+  AmazonBedrockExecutionRoleForAgentsQA:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AgentName}-ExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws-us-gov:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws-us-gov:iam::aws:policy/AWSLambda_FullAccess
+      Policies:
+        - PolicyName: BedrockAgentLambdaInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: "*"
+  
+  # Update the AmazonBedrockExecutionRoleForAgentsQA with Lambda invoke permission
+  LambdaInvokePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AgentName}-LambdaInvokePolicy"
+      Roles:
+        - !Ref AmazonBedrockExecutionRoleForAgentsQA
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt CreateVPCFunction.Arn
+              - !GetAtt CreateVPCComponentsFunction.Arn
+              - !GetAtt CreateEC2InstanceFunction.Arn
+
+  # Existing Knowledge Base
+  KnowledgeBaseWithAoss:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Ref KnowledgeBaseName
+      Description: !Ref KnowledgeBaseDescription
+      RoleArn: !ImportValue OpenSearch-Serverless-BedrockExecutionRoleArn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !ImportValue OpenSearch-Serverless-CollectionARN
+          VectorIndexName: !ImportValue OpenSearch-Serverless-AOSSVectorIndexName
+          FieldMapping:
+            VectorField: "vector"
+            TextField: "text"
+            MetadataField: "metadata"
+
+  SampleDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBaseWithAoss
+      Name: !ImportValue OpenSearch-Serverless-S3BucketName
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !ImportValue OpenSearch-Serverless-S3BucketArn
+  
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AgentName}-LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws-us-gov:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaEC2VPCPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateVpc
+                  - ec2:CreateSubnet
+                  - ec2:RunInstances
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeImages
+                  - ec2:DescribeSubnets
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateTags
+                  - ec2:CreateInternetGateway
+                  - ec2:CreateNatGateway
+                  - ec2:CreateRoute
+                  - ec2:CreateRouteTable
+                  - ec2:CreateVpcEndpoint
+                  - ec2:CreateSecurityGroup
+                  - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AttachInternetGateway
+                  - ec2:AttachNetworkInterface
+                  - ec2:AssociateRouteTable
+                  - ec2:AllocateAddress
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcEndpointService
+                  - ec2:DescribeVpcEndpointServices
+                  - ssm:GetParameter
+                Resource: "*"
+        - PolicyName: LambdaIAMPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:GetInstanceProfile
+                  - iam:CreateInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                Resource:
+                  - !Sub "arn:aws-us-gov:iam::${AWS::AccountId}:role/BedrockEC2-SSM-Role"
+                  - !Sub "arn:aws-us-gov:iam::${AWS::AccountId}:instance-profile/BedrockEC2-SSM-InstanceProfile"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub "arn:aws-us-gov:iam::${AWS::AccountId}:role/BedrockEC2-SSM-Role"
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": "ec2.amazonaws.com"
+  
+  # ------------------------------------------
+  # Lambda Permissions to allow Bedrock Agent
+  # ------------------------------------------
+
+  CreateVPCLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateVPCFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  CreateVPCComponentsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateVPCComponentsFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  CreateEndpointLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateEndpointFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+
+  CreateEC2InstanceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateEC2InstanceFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+
+  # Lambda Functions for Action Groups
+  CreateVPCFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AgentName}-create-vpc"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json, boto3
+
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+
+              properties = event.get("requestBody", {}).get("content", {}).get("application/json", {}).get("properties", [])
+
+              # Initialize
+              cidr_block = None
+              vpc_name = None
+
+              # Extract values
+              for prop in properties:
+                  if prop.get("name") == "cidrBlock":
+                      cidr_block = prop.get("value")
+                  elif prop.get("name") == "vpcName":
+                      vpc_name = prop.get("value")
+
+              if not cidr_block:
+                  response_body = json.dumps({
+                      "error": "Missing 'cidrBlock' in request body"
+                  })
+                  http_status_code = 400
+              else:
+                  ec2 = boto3.client('ec2')
+                  response = ec2.create_vpc(CidrBlock=cidr_block)
+                  vpc_id = response['Vpc']['VpcId']
+                  # Enable DNS hostnames
+                  ec2.modify_vpc_attribute(
+                      VpcId=vpc_id,
+                      EnableDnsHostnames={'Value': True}
+                  )                  
+                  # Add name tag if provided
+                  if vpc_name:
+                      ec2.create_tags(
+                          Resources=[vpc_id],
+                          Tags=[{'Key': 'Name', 'Value': vpc_name}]
+                      )
+                      message = f"VPC {vpc_id} created with CIDR {cidr_block} and name {vpc_name}"
+                  else:
+                      message = f"VPC {vpc_id} created with CIDR {cidr_block}"
+
+                  response_body = json.dumps({
+                      "message": message,
+                      "vpcId": vpc_id
+                  })
+                  http_status_code = 200
+
+              # Final Bedrock-compatible response
+              api_response = {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event["actionGroup"],
+                      "apiPath": event["apiPath"],
+                      "httpMethod": event["httpMethod"],
+                      "httpStatusCode": http_status_code,
+                      "responseBody": {
+                          "application/json": {
+                              "body": response_body
+                          }
+                      }
+                  },
+                  "sessionAttributes": event.get("sessionAttributes", {}),
+                  "promptSessionAttributes": event.get("promptSessionAttributes", {})
+              }
+
+              print("Final API Response:", json.dumps(api_response))
+              return api_response
+
+  CreateVPCComponentsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AgentName}-create-vpc-components"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json, boto3, ipaddress
+
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+
+              properties = event.get("requestBody", {}).get("content", {}).get("application/json", {}).get("properties", [])
+
+              vpc_id = cidr_block = az = public_subnet_name = private_subnet_name = None
+
+              # Extract parameters
+              for prop in properties:
+                  if prop.get("name") == "vpcId":
+                      vpc_id = prop.get("value")
+                  elif prop.get("name") == "cidrBlock":
+                      cidr_block = prop.get("value")
+                  elif prop.get("name") == "availabilityZone":
+                      az = prop.get("value")
+                  elif prop.get("name") == "publicSubnetName":
+                      public_subnet_name = prop.get("value")
+                  elif prop.get("name") == "privateSubnetName":
+                      private_subnet_name = prop.get("value")
+
+              if not all([vpc_id, cidr_block, az]):
+                  response_body = json.dumps({
+                      "error": "Missing required parameters: vpcId, cidrBlock, availabilityZone"
+                  })
+                  http_status_code = 400
+              else:
+                  ec2 = boto3.client('ec2')
+
+                  # Subnetting
+                  network = ipaddress.IPv4Network(cidr_block)
+                  subnets = list(network.subnets(new_prefix=27))
+                  public_cidr = str(subnets[0])
+                  private_cidr = str(subnets[1])
+
+                  created_subnets = {}
+
+                  # Create Public Subnet
+                  pub_subnet = ec2.create_subnet(
+                      VpcId=vpc_id,
+                      CidrBlock=public_cidr,
+                      AvailabilityZone=az
+                  )["Subnet"]["SubnetId"]
+                  if public_subnet_name:
+                      ec2.create_tags(Resources=[pub_subnet], Tags=[{"Key": "Name", "Value": public_subnet_name}])
+                  created_subnets["publicSubnetId"] = pub_subnet
+
+                  # Create Private Subnet
+                  priv_subnet = ec2.create_subnet(
+                      VpcId=vpc_id,
+                      CidrBlock=private_cidr,
+                      AvailabilityZone=az
+                  )["Subnet"]["SubnetId"]
+                  if private_subnet_name:
+                      ec2.create_tags(Resources=[priv_subnet], Tags=[{"Key": "Name", "Value": private_subnet_name}])
+                  created_subnets["privateSubnetId"] = priv_subnet
+
+                  # Create Internet Gateway & attach to VPC
+                  igw = ec2.create_internet_gateway()["InternetGateway"]["InternetGatewayId"]
+                  ec2.attach_internet_gateway(VpcId=vpc_id, InternetGatewayId=igw)
+
+                  # Create Route Tables
+                  pub_rt = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+                  priv_rt = ec2.create_route_table(VpcId=vpc_id)["RouteTable"]["RouteTableId"]
+
+                  # Associate Public Subnet & add default route to IGW
+                  ec2.associate_route_table(RouteTableId=pub_rt, SubnetId=pub_subnet)
+                  ec2.create_route(RouteTableId=pub_rt, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw)
+
+                  # Create NAT Gateway in public subnet
+                  eip = ec2.allocate_address(Domain='vpc')["AllocationId"]
+                  nat_gw_response = ec2.create_nat_gateway(SubnetId=pub_subnet, AllocationId=eip)
+                  nat_gw = nat_gw_response["NatGateway"]["NatGatewayId"]
+
+                  # Inform user that NAT Gateway will take a few minutes
+                  intermediate_response_body = json.dumps({
+                      "message": f"NAT Gateway {nat_gw} is being created. This might take a few minutes. Please be patient."
+                  })
+                  intermediate_api_response = {
+                      "messageVersion": "1.0",
+                      "response": {
+                          "actionGroup": event["actionGroup"],
+                          "apiPath": event["apiPath"],
+                          "httpMethod": event["httpMethod"],
+                          "httpStatusCode": 202,
+                          "responseBody": {
+                              "application/json": {
+                                  "body": intermediate_response_body
+                              }
+                          }
+                      },
+                      "sessionAttributes": event.get("sessionAttributes", {}),
+                      "promptSessionAttributes": event.get("promptSessionAttributes", {})
+                  }
+                  print("Intermediate Response (about NAT creation):", json.dumps(intermediate_api_response))
+
+                  # Wait for NAT Gateway to become available
+                  print(f"Waiting for NAT Gateway {nat_gw} to become available...")
+                  waiter = ec2.get_waiter('nat_gateway_available')
+                  waiter.wait(NatGatewayIds=[nat_gw])
+                  print(f"NAT Gateway {nat_gw} is now available.")
+
+                  # Associate Private Subnet & route to NAT GW
+                  ec2.associate_route_table(RouteTableId=priv_rt, SubnetId=priv_subnet)
+                  ec2.create_route(RouteTableId=priv_rt, DestinationCidrBlock="0.0.0.0/0", NatGatewayId=nat_gw)
+                  final_response_body = json.dumps({
+                      "message": f"Subnets, IGW, NAT GW (available), routes created in {az}",
+                      "createdSubnets": created_subnets,
+                      "internetGatewayId": igw,
+                      "natGatewayId": nat_gw
+                  })
+
+                  http_status_code = 200
+
+              # Bedrock-compatible final response
+              api_response = {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event["actionGroup"],
+                      "apiPath": event["apiPath"],
+                      "httpMethod": event["httpMethod"],
+                      "httpStatusCode": http_status_code,
+                      "responseBody": {
+                          "application/json": {
+                              "body": final_response_body
+                          }
+                      }
+                  },
+                  "sessionAttributes": event.get("sessionAttributes", {}),
+                  "promptSessionAttributes": event.get("promptSessionAttributes", {})
+              }
+
+              print("Final API Response:", json.dumps(api_response))
+              return api_response
+
+  CreateEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AgentName}-create-endpoints"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json, boto3
+          def lambda_handler(event, context):
+              print("=== RAW EVENT ===")
+              print(json.dumps(event, indent=2))
+              print("=== END RAW EVENT ===")
+              
+              try:
+                  # Extract parameters from Bedrock agent format
+                  request_body = event.get("requestBody", {})
+                  
+                  # Handle case where requestBody is a JSON string
+                  if isinstance(request_body, str):
+                      try:
+                          request_body = json.loads(request_body)
+                          print("Parsed requestBody from JSON string")
+                      except json.JSONDecodeError as e:
+                          print(f"Failed to parse requestBody as JSON: {str(e)}")
+                          return create_error_response(event, 400, f"Invalid JSON in requestBody: {str(e)}")
+                  
+                  content = request_body.get("content", {})
+                  
+                  # Handle case where content is a JSON string
+                  if isinstance(content, str):
+                      try:
+                          content = json.loads(content)
+                          print("Parsed content from JSON string")
+                      except json.JSONDecodeError as e:
+                          print(f"Failed to parse content as JSON: {str(e)}")
+                          return create_error_response(event, 400, f"Invalid JSON in content: {str(e)}")
+                  
+                  app_json = content.get("application/json", {})
+                  
+                  # Handle case where app_json is a JSON string
+                  if isinstance(app_json, str):
+                      try:
+                          app_json = json.loads(app_json)
+                          print("Parsed app_json from JSON string")
+                      except json.JSONDecodeError as e:
+                          print(f"Failed to parse app_json as JSON: {str(e)}")
+                          return create_error_response(event, 400, f"Invalid JSON in application/json: {str(e)}")
+                  
+                  properties = app_json.get("properties", [])
+                  
+                  print(f"RequestBody type: {type(request_body)}, content: {json.dumps(request_body, indent=2) if isinstance(request_body, dict) else repr(request_body)}")
+                  print(f"Content type: {type(content)}, content: {json.dumps(content, indent=2) if isinstance(content, dict) else repr(content)}")
+                  print(f"App_json type: {type(app_json)}, content: {json.dumps(app_json, indent=2) if isinstance(app_json, dict) else repr(app_json)}")
+                  print(f"Properties type: {type(properties)}, content: {json.dumps(properties, indent=2) if isinstance(properties, list) else repr(properties)}")
+                  
+                  if not properties:
+                      print("No properties found, checking alternative parameter extraction methods...")
+                      
+                      # Alternative 1: Check if parameters are directly in the event
+                      if any(key in event for key in ['vpcId', 'vpcCidr', 'endpointRequests']):
+                          print("Found parameters directly in event")
+                          params = {
+                              "vpcCidr": event.get("vpcCidr"),
+                              "vpcId": event.get("vpcId"), 
+                              "availabilityZone": event.get("availabilityZone"),
+                              "endpointRequests": event.get("endpointRequests", [])
+                          }
+                      # Alternative 2: Check if the entire requestBody is the parameters
+                      elif isinstance(request_body, dict) and any(key in request_body for key in ['vpcId', 'vpcCidr', 'endpointRequests']):
+                          print("Found parameters directly in requestBody")
+                          params = {
+                              "vpcCidr": request_body.get("vpcCidr"),
+                              "vpcId": request_body.get("vpcId"), 
+                              "availabilityZone": request_body.get("availabilityZone"),
+                              "endpointRequests": request_body.get("endpointRequests", [])
+                          }
+                      else:
+                          return create_error_response(event, 400, "No properties found in request body and no alternative parameter format detected")
+                  else:
+                      # Parse parameters from properties array
+                      params = {}
+                      for prop in properties:
+                          if not isinstance(prop, dict):
+                              print(f"Warning: property is not a dict: {type(prop)} = {repr(prop)}")
+                              continue
+                              
+                          if prop.get("name") == "endpointRequests" and prop.get("type") == "array":
+                              try:
+                                  # Clean up the JSON string and parse it
+                                  json_str = prop.get("value", "").strip()
+                                  print(f"Raw endpointRequests value: {repr(json_str)}")
+                                  
+                                  # Try parsing as JSON first
+                                  try:
+                                      params["endpointRequests"] = json.loads(json_str)
+                                  except json.JSONDecodeError:
+                                      # If JSON parsing fails, try parsing as Python-style list
+                                      print("JSON parsing failed, trying Python-style list parsing...")
+                                      
+                                      # Handle Python-style list: '[item1, item2, item3]'
+                                      if json_str.startswith('[') and json_str.endswith(']'):
+                                          # Remove brackets and split by comma
+                                          content = json_str[1:-1].strip()
+                                          if content:
+                                              # Split by comma and clean up each item
+                                              items = [item.strip() for item in content.split(',')]
+                                              print(f"Parsed service names: {items}")
+                                              
+                                              # Convert to the expected format with subnetId
+                                              # We'll need to get subnetId from somewhere else or use a default
+                                              # For now, let's assume we need to create the format the rest of the code expects
+                                              endpoint_requests = []
+                                              for service_name in items:
+                                                  endpoint_requests.append({
+                                                      "serviceName": service_name,
+                                                      "subnetId": None  # Will need to be filled in later
+                                                  })
+                                              params["endpointRequests"] = endpoint_requests
+                                          else:
+                                              params["endpointRequests"] = []
+                                      else:
+                                          # Try parsing as a simple comma-separated string
+                                          items = [item.strip() for item in json_str.split(',')]
+                                          endpoint_requests = []
+                                          for service_name in items:
+                                              if service_name:  # Skip empty items
+                                                  endpoint_requests.append({
+                                                      "serviceName": service_name,
+                                                      "subnetId": None  # Will need to be filled in later
+                                                  })
+                                          params["endpointRequests"] = endpoint_requests
+                                          
+                              except Exception as e:
+                                  print(f"Error parsing endpointRequests: {str(e)}")
+                                  print(f"Raw value: {repr(prop.get('value'))}")
+                                  return create_error_response(event, 400, f"Invalid format in endpointRequests: {str(e)}")
+                          else:
+                              params[prop.get("name")] = prop.get("value")
+                  
+                  vpc_cidr = params.get("vpcCidr")
+                  vpc_id = params.get("vpcId")
+                  az = params.get("availabilityZone")
+                  endpoint_requests = params.get("endpointRequests", [])
+                  
+                  print("Parsed parameters:", json.dumps(params, indent=2))
+                  
+                  # Check if vpcId is provided
+                  if not vpc_id:
+                      return create_error_response(event, 400, "Missing 'vpcId' in the request")
+                  
+                  # If we don't have subnet information in endpoint requests, try to find a subnet in the VPC
+                  subnet_id = None
+                  if endpoint_requests and any(req.get("subnetId") is None for req in endpoint_requests):
+                      print("Some endpoint requests missing subnetId, attempting to find a suitable subnet...")
+                      try:
+                          ec2 = boto3.client('ec2')
+                          subnets_response = ec2.describe_subnets(
+                              Filters=[
+                                  {'Name': 'vpc-id', 'Values': [vpc_id]},
+                                  {'Name': 'state', 'Values': ['available']}
+                              ]
+                          )
+                          
+                          if subnets_response['Subnets']:
+                              # Use the first available subnet
+                              subnet_id = subnets_response['Subnets'][0]['SubnetId']
+                              print(f"Found subnet to use: {subnet_id}")
+                              
+                              # Update endpoint requests that don't have subnetId
+                              for req in endpoint_requests:
+                                  if req.get("subnetId") is None:
+                                      req["subnetId"] = subnet_id
+                          else:
+                              return create_error_response(event, 400, f"No available subnets found in VPC {vpc_id}")
+                              
+                      except Exception as e:
+                          print(f"Error finding subnet: {str(e)}")
+                          return create_error_response(event, 500, f"Failed to find subnet in VPC: {str(e)}")
+                  
+                  ec2 = boto3.client('ec2')
+                  
+                  # Check for existing security group or create a new one
+                  sg_name = f'VPCEndpointSG-{vpc_id[-8:]}'
+                  sg_id = None
+                  sg_created = False
+                  
+                  try:
+                      # Check if security group already exists
+                      existing_sgs = ec2.describe_security_groups(
+                          Filters=[
+                              {'Name': 'group-name', 'Values': [sg_name]},
+                              {'Name': 'vpc-id', 'Values': [vpc_id]}
+                          ]
+                      )
+                      
+                      if existing_sgs['SecurityGroups']:
+                          # Reuse existing security group
+                          sg_id = existing_sgs['SecurityGroups'][0]['GroupId']
+                          print(f"Reusing existing security group: {sg_id}")
+                      else:
+                          # Create new security group
+                          sg_response = ec2.create_security_group(
+                              GroupName=sg_name,
+                              Description='Security group for VPC endpoint access',
+                              VpcId=vpc_id
+                          )
+                          sg_id = sg_response['GroupId']
+                          sg_created = True
+                          print(f"Created new security group: {sg_id}")
+                          
+                          # Add ingress rule only for newly created security group
+                          if vpc_cidr:
+                              ec2.authorize_security_group_ingress(
+                                  GroupId=sg_id,
+                                  IpPermissions=[
+                                      {
+                                          'IpProtocol': 'tcp',
+                                          'FromPort': 443,
+                                          'ToPort': 443,
+                                          'IpRanges': [{'CidrIp': vpc_cidr}]
+                                      }
+                                  ]
+                              )
+                          else:
+                              # Fallback: Allow HTTPS from anywhere within the VPC (you may want to make this more restrictive)
+                              ec2.authorize_security_group_ingress(
+                                  GroupId=sg_id,
+                                  IpPermissions=[
+                                      {
+                                          'IpProtocol': 'tcp',
+                                          'FromPort': 443,
+                                          'ToPort': 443,
+                                          'IpRanges': [{'CidrIp': '10.0.0.0/8'}]  # Adjust as needed
+                                      }
+                                  ]
+                              )
+                          
+                  except Exception as e:
+                      print(f"Error with security group: {str(e)}")
+                      return create_error_response(event, 500, f"Failed to handle security group: {str(e)}")
+                  
+                  # List to store responses for all endpoints created
+                  endpoint_creation_responses = []
+                  
+                  # Get existing VPC endpoints to avoid duplicates
+                  try:
+                      existing_endpoints = ec2.describe_vpc_endpoints(
+                          Filters=[
+                              {'Name': 'vpc-id', 'Values': [vpc_id]},
+                              {'Name': 'vpc-endpoint-state', 'Values': ['available', 'pending']}
+                          ]
+                      )
+                      existing_services = {ep['ServiceName'] for ep in existing_endpoints['VpcEndpoints']}
+                      print(f"Found {len(existing_services)} existing VPC endpoints: {existing_services}")
+                  except Exception as e:
+                      print(f"Warning: Could not fetch existing endpoints: {str(e)}")
+                      existing_services = set()
+                  
+                  # Iterate over each endpoint request and create VPC endpoints
+                  for endpoint_request in endpoint_requests:
+                      service_name = endpoint_request.get("serviceName")
+                      subnet_id = endpoint_request.get("subnetId")
+                      
+                      if not service_name or not subnet_id:
+                          endpoint_creation_responses.append({
+                              "type": "Error",
+                              "serviceName": service_name,
+                              "message": "Missing serviceName or subnetId"
+                          })
+                          continue
+                      
+                      # Check if endpoint already exists
+                      if service_name in existing_services:
+                          endpoint_creation_responses.append({
+                              "type": "Skipped",
+                              "serviceName": service_name,
+                              "message": f"VPC endpoint for {service_name} already exists in this VPC"
+                          })
+                          continue
+                      
+                      try:
+                          # Create VPC Endpoint
+                          endpoint_name = service_name.split('.')[-1]  # Extract service name (e.g., 'ssm' from 'com.amazonaws.us-gov-west-1.ssm')
+                          
+                          # Try with private DNS enabled first
+                          try:
+                              response = ec2.create_vpc_endpoint(
+                                  VpcId=vpc_id,
+                                  ServiceName=service_name,
+                                  VpcEndpointType='Interface',
+                                  SubnetIds=[subnet_id],
+                                  SecurityGroupIds=[sg_id],
+                                  PrivateDnsEnabled=True
+                              )
+                              private_dns_enabled = True
+                          except Exception as dns_error:
+                              # If private DNS fails (conflicting domain), try without it
+                              if "private-dns-enabled cannot be set" in str(dns_error).lower() or "conflicting DNS domain" in str(dns_error):
+                                  print(f"Private DNS conflict for {service_name}, creating without private DNS")
+                                  response = ec2.create_vpc_endpoint(
+                                      VpcId=vpc_id,
+                                      ServiceName=service_name,
+                                      VpcEndpointType='Interface',
+                                      SubnetIds=[subnet_id],
+                                      SecurityGroupIds=[sg_id],
+                                      PrivateDnsEnabled=False
+                                  )
+                                  private_dns_enabled = False
+                              else:
+                                  # Re-raise if it's a different error
+                                  raise dns_error
+                          
+                          endpoint_id = response['VpcEndpoint']['VpcEndpointId']
+                          dns_status = "enabled" if private_dns_enabled else "disabled (conflict resolved)"
+                          message = f"VPC endpoint {endpoint_id} created for service {service_name} (Private DNS: {dns_status})"
+                          
+                          endpoint_creation_responses.append({
+                              "type": "VPCEndpoint",
+                              "endpointName": endpoint_name,
+                              "endpointId": endpoint_id,
+                              "serviceName": service_name,
+                              "privateDnsEnabled": private_dns_enabled,
+                              "message": message
+                          })
+                          
+                      except Exception as e:
+                          print(f"Error creating VPC endpoint for {service_name}: {str(e)}")
+                          endpoint_creation_responses.append({
+                              "type": "Error",
+                              "serviceName": service_name,
+                              "message": f"Failed to create VPC endpoint: {str(e)}"
+                          })
+                  
+                  # Create response
+                  response = {
+                      "statusCode": 200,
+                      "message": "VPC endpoints creation completed",
+                      "securityGroupId": sg_id,
+                      "securityGroupStatus": "created" if sg_created else "reused",
+                      "createdEndpoints": endpoint_creation_responses
+                  }
+                  
+                  return create_success_response(event, response, vpc_id)
+                  
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return create_error_response(event, 500, f"Internal server error: {str(e)}")
+
+          def create_success_response(event, response_body, vpc_id=None):
+              """Create a properly formatted success response for Bedrock agent"""
+              session_attributes = event.get("sessionAttributes", {})
+              
+              # Store vpcId in session attributes for future requests
+              if vpc_id:
+                  session_attributes["vpcId"] = vpc_id
+              
+              api_response = {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event["actionGroup"],
+                      "apiPath": event["apiPath"],
+                      "httpMethod": event["httpMethod"],
+                      "httpStatusCode": 200,
+                      "responseBody": {
+                          "application/json": {
+                              "body": json.dumps(response_body)
+                          }
+                      }
+                  },
+                  "sessionAttributes": session_attributes,
+                  "promptSessionAttributes": event.get("promptSessionAttributes", {})
+              }
+              
+              print("Final API Response:", json.dumps(api_response))
+              return api_response
+
+          def create_error_response(event, status_code, message):
+              """Create a properly formatted error response for Bedrock agent"""
+              error_body = {
+                  "statusCode": status_code,
+                  "message": message
+              }
+              
+              api_response = {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event["actionGroup"],
+                      "apiPath": event["apiPath"],
+                      "httpMethod": event["httpMethod"],
+                      "httpStatusCode": status_code,
+                      "responseBody": {
+                          "application/json": {
+                              "body": json.dumps(error_body)
+                          }
+                      }
+                  },
+                  "sessionAttributes": event.get("sessionAttributes", {}),
+                  "promptSessionAttributes": event.get("promptSessionAttributes", {})
+              }
+              
+              print("Error API Response is:", json.dumps(api_response))
+              return api_response
+
+  CreateEC2InstanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AgentName}-create-ec2-instance"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def get_ami_from_ssm(ec2, os_type):
+              """Get latest AMI using SSM parameters (most reliable method)"""
+              ssm = boto3.client('ssm')
+              
+              if os_type == "windows":
+                  # SSM parameter for latest Windows Server
+                  ssm_parameter = "/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base"
+              else:
+                  # SSM parameter for latest Amazon Linux 2023
+                  ssm_parameter = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+              
+              print(f"Querying SSM parameter: {ssm_parameter}")
+              
+              try:
+                  response = ssm.get_parameter(Name=ssm_parameter)
+                  ami_id = response['Parameter']['Value']
+                  print(f"SSM returned AMI ID: {ami_id}")
+                  return ami_id
+              except Exception as e:
+                  raise Exception(f"SSM parameter lookup failed for {ssm_parameter}: {str(e)}")
+
+          def lambda_handler(event, context):
+              print("=== RAW EVENT ===")
+              print(json.dumps(event, indent=2))
+              print("=== END RAW EVENT ===")
+              
+              try:
+                  # Extract parameters from Bedrock agent format
+                  properties = event.get("requestBody", {}).get("content", {}).get("application/json", {}).get("properties", [])
+                  print(f"Found {len(properties)} properties in request")
+                  
+                  # Parse parameters
+                  params = {}
+                  for prop in properties:
+                      params[prop["name"]] = prop["value"]
+                  
+                  # Get parameters with fallbacks to session attributes
+                  session_attributes = event.get("sessionAttributes", {})
+                  
+                  # Try to get subnet from parameters, then session, then error
+                  subnet_id = params.get("subnetId") or session_attributes.get("subnetId") or session_attributes.get("privateSubnetId")
+                  instance_type = params.get("instanceType", "t3.micro")  # Default to t3.micro
+                  os_type = params.get("osType", "linux").lower()  # Default to linux
+                  vpc_id = params.get("vpcId") or session_attributes.get("vpcId")
+                  ami_id = params.get("amiId")  # Allow Bedrock to pass AMI ID directly
+                  
+                  print("Extracted parameters:")
+                  print(f"  subnet_id: {subnet_id}")
+                  print(f"  instance_type: {instance_type}")
+                  print(f"  os_type: {os_type}")
+                  print(f"  vpc_id: {vpc_id}")
+                  print(f"  ami_id: {ami_id}")
+                  
+                  # Validate required parameters
+                  if not subnet_id:
+                      return create_error_response(event, 400, "Missing 'subnetId' - please provide subnet or run subnet creation first")
+                  
+                  ec2 = boto3.client('ec2')
+                  
+                  # Get the AMI ID - use provided one, SSM parameter, or discover latest
+                  try:
+                      if ami_id:
+                          print(f"Using provided AMI ID: {ami_id}")
+                          # Validate the AMI exists and is available
+                          ami_response = ec2.describe_images(ImageIds=[ami_id])
+                          if not ami_response['Images'] or ami_response['Images'][0]['State'] != 'available':
+                              return create_error_response(event, 400, f"Provided AMI {ami_id} is not available")
+                      else:
+                          # Try SSM parameter first (most reliable method)
+                          try:
+                              ami_id = get_ami_from_ssm(ec2, os_type)
+                              print(f"Got AMI from SSM: {ami_id}")
+                          except Exception as ssm_error:
+                              print(f"SSM lookup failed: {ssm_error}, falling back to discovery")
+                              # Fall back to AMI discovery
+                              if os_type == "windows":
+                                  ami_id = get_latest_windows_ami(ec2)
+                                  print(f"Selected Windows AMI: {ami_id}")
+                              else:  # Default to Linux
+                                  ami_id = get_latest_amazon_linux_ami(ec2)
+                                  print(f"Selected Amazon Linux AMI: {ami_id}")
+                  except Exception as e:
+                      return create_error_response(event, 500, f"Failed to get AMI: {str(e)}")
+                  
+                  # Get or create security group for EC2 instances
+                  try:
+                      sg_id = get_or_create_ec2_security_group(ec2, vpc_id, subnet_id)
+                      print(f"Using security group: {sg_id}")
+                  except Exception as e:
+                      return create_error_response(event, 500, f"Failed to handle security group: {str(e)}")
+                  
+                  # Create EC2 instance
+                  try:
+                      print(f"Launching EC2 instance: AMI={ami_id}, Type={instance_type}, Subnet={subnet_id}")
+                      
+                      # Get the IAM instance profile ARN before launching the instance
+                      instance_profile_arn = get_or_create_ssm_instance_role()  # Fetch or create the IAM role profile
+
+                      instance_response = ec2.run_instances(
+                          ImageId=ami_id,
+                          InstanceType=instance_type,
+                          MaxCount=1,
+                          MinCount=1,
+                          SubnetId=subnet_id,  # Changed from SubnetIds to SubnetId
+                          SecurityGroupIds=[sg_id],
+                          IamInstanceProfile={
+                              'Arn': instance_profile_arn  # Explicitly attach the instance profile here
+                          },
+                          TagSpecifications=[
+                              {
+                                  'ResourceType': 'instance',
+                                  'Tags': [
+                                      {'Key': 'Name', 'Value': f'Bedrock-{os_type.title()}-Instance'},
+                                      {'Key': 'CreatedBy', 'Value': 'Bedrock-Agent'},
+                                      {'Key': 'OS', 'Value': os_type.title()}
+                                  ]
+                              }
+                          ]
+                      )
+                      
+                      instance_id = instance_response['Instances'][0]['InstanceId']
+                      private_ip = instance_response['Instances'][0]['PrivateIpAddress']
+                      
+                      # Create response
+                      response = {
+                          "statusCode": 200,
+                          "message": f"EC2 instance {instance_id} created successfully",
+                          "instanceId": instance_id,
+                          "privateIpAddress": private_ip,
+                          "instanceType": instance_type,
+                          "operatingSystem": os_type.title(),
+                          "amiId": ami_id,
+                          "subnetId": subnet_id,
+                          "securityGroupId": sg_id,
+                          "iamInstanceProfile": instance_profile_arn.split('/')[-1] if instance_profile_arn else "None",
+                          "ssmEnabled": bool(instance_profile_arn),
+                          "connectionInfo": "Use AWS Systems Manager Session Manager to connect to this instance securely through the AWS Console" if instance_profile_arn else "No IAM instance profile attached - Session Manager not available"
+                      }
+
+                      return create_success_response(event, response, subnet_id, vpc_id)
+                      
+                  except Exception as e:
+                      print(f"Error creating EC2 instance: {str(e)}")
+                      return create_error_response(event, 500, f"Failed to create EC2 instance: {str(e)}")
+                  
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return create_error_response(event, 500, f"Internal server error: {str(e)}")
+
+          def get_latest_amazon_linux_ami(ec2):
+              """Get the latest Amazon Linux AMI (works in both commercial and GovCloud)"""
+              # Try multiple AMI patterns for broader compatibility
+              ami_patterns = [
+                  'al2023-ami-*-x86_64',           # Amazon Linux 2023
+                  'amzn2-ami-hvm-*-x86_64-gp2',   # Amazon Linux 2
+                  'al2-ami-*-x86_64'              # Alternative AL2 pattern
+              ]
+              
+              # Try different owner IDs (commercial vs GovCloud)
+              owner_ids = [
+                  '137112412989',  # Amazon's standard owner ID
+                  '513442679011',  # AWS GovCloud owner ID  
+                  '219670896067',  # Alternative GovCloud owner ID (confirmed for Red Hat, may work for others)
+                  'amazon'         # Generic Amazon owner
+              ]
+              
+              for pattern in ami_patterns:
+                  for owner_id in owner_ids:
+                      try:
+                          print(f"Searching for AMI pattern: {pattern} with owner: {owner_id}")
+                          response = ec2.describe_images(
+                              Filters=[
+                                  {'Name': 'name', 'Values': [pattern]},
+                                  {'Name': 'vpc-endpoint-state', 'Values': ['available']},
+                                  {'Name': 'architecture', 'Values': ['x86_64']}
+                              ],
+                              Owners=[owner_id] if owner_id != 'amazon' else ['amazon']
+                          )
+                          
+                          if response['Images']:
+                              # Sort by creation date and get the latest
+                              latest_ami = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)[0]
+                              print(f"Found AMI: {latest_ami['ImageId']} - {latest_ami['Name']}")
+                              return latest_ami['ImageId']
+                              
+                      except Exception as e:
+                          print(f"Search failed for {pattern}/{owner_id}: {str(e)}")
+                          continue
+              
+              raise Exception("No compatible Amazon Linux AMIs found in this region")
+
+          def get_latest_windows_ami(ec2):
+              """Get the latest Windows Server AMI (works in both commercial and GovCloud)"""
+              # Try multiple Windows patterns
+              windows_patterns = [
+                  'Windows_Server-2022-English-Full-Base-*',
+                  'Windows_Server-2019-English-Full-Base-*',
+                  'EC2LaunchV2-Windows_Server-2022-English-Full-Base-*'
+              ]
+              
+              # Try different owner IDs
+              owner_ids = [
+                  '801119661308',  # Amazon's Windows owner ID 
+                  '513442679011',  # AWS GovCloud owner ID
+                  '219670896067',  # Alternative GovCloud owner ID
+                  'amazon'         # Generic Amazon owner
+              ]
+              
+              for pattern in windows_patterns:
+                  for owner_id in owner_ids:
+                      try:
+                          print(f"Searching for Windows AMI pattern: {pattern} with owner: {owner_id}")
+                          response = ec2.describe_images(
+                              Filters=[
+                                  {'Name': 'name', 'Values': [pattern]},
+                                  {'Name': 'state', 'Values': ['available']},
+                                  {'Name': 'architecture', 'Values': ['x86_64']}
+                              ],
+                              Owners=[owner_id] if owner_id != 'amazon' else ['amazon']
+                          )
+                          
+                          if response['Images']:
+                              # Sort by creation date and get the latest
+                              latest_ami = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)[0]
+                              print(f"Found Windows AMI: {latest_ami['ImageId']} - {latest_ami['Name']}")
+                              return latest_ami['ImageId']
+                              
+                      except Exception as e:
+                          print(f"Windows search failed for {pattern}/{owner_id}: {str(e)}")
+                          continue
+              
+              raise Exception("No compatible Windows Server AMIs found in this region")
+
+          def get_or_create_ec2_security_group(ec2, vpc_id, subnet_id):
+              """Get existing or create new security group for EC2 instances"""
+              if not vpc_id:
+                  # Get VPC ID from subnet if not provided
+                  subnet_response = ec2.describe_subnets(SubnetIds=[subnet_id])
+                  vpc_id = subnet_response['Subnets'][0]['VpcId']
+              
+              sg_name = f'EC2-SecurityGroup-{vpc_id[-8:]}'
+              
+              try:
+                  # Check if security group already exists
+                  existing_sgs = ec2.describe_security_groups(
+                      Filters=[
+                          {'Name': 'group-name', 'Values': [sg_name]},
+                          {'Name': 'vpc-id', 'Values': [vpc_id]}
+                      ]
+                  )
+                  
+                  if existing_sgs['SecurityGroups']:
+                      return existing_sgs['SecurityGroups'][0]['GroupId']
+                  
+                  # Create new security group
+                  sg_response = ec2.create_security_group(
+                      GroupName=sg_name,
+                      Description='Security group for EC2 instances created by Bedrock agent',
+                      VpcId=vpc_id
+                  )
+                  sg_id = sg_response['GroupId']
+                  
+                  # Add basic ingress rules
+                  ec2.authorize_security_group_ingress(
+                      GroupId=sg_id,
+                      IpPermissions=[
+                          {
+                              'IpProtocol': 'tcp',
+                              'FromPort': 22,  # SSH for Linux
+                              'ToPort': 22,
+                              'IpRanges': [{'CidrIp': '10.0.0.0/8', 'Description': 'SSH access from private networks'}]
+                          },
+                          {
+                              'IpProtocol': 'tcp',
+                              'FromPort': 3389,  # RDP for Windows
+                              'ToPort': 3389,
+                              'IpRanges': [{'CidrIp': '10.0.0.0/8', 'Description': 'RDP access from private networks'}]
+                          },
+                          {
+                              'IpProtocol': 'tcp',
+                              'FromPort': 80,  # HTTP
+                              'ToPort': 80,
+                              'IpRanges': [{'CidrIp': '10.0.0.0/8', 'Description': 'HTTP access from private networks'}]
+                          },
+                          {
+                              'IpProtocol': 'tcp',
+                              'FromPort': 443,  # HTTPS
+                              'ToPort': 443,
+                              'IpRanges': [{'CidrIp': '10.0.0.0/8', 'Description': 'HTTPS access from private networks'}]
+                          }
+                      ]
+                  )
+                  
+                  return sg_id
+                  
+              except Exception as e:
+                  raise Exception(f"Security group handling failed: {str(e)}")
+
+          def get_or_create_ssm_instance_role():
+              """Get existing or create new IAM role for EC2 instances with SSM permissions"""
+              iam = boto3.client('iam')
+              
+              role_name = 'BedrockEC2-SSM-Role'
+              instance_profile_name = 'BedrockEC2-SSM-InstanceProfile'
+              instance_profile_arn = None  # Initialize the variable
+              
+              # Trust policy for EC2 service
+              trust_policy = {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Effect": "Allow",
+                          "Principal": {
+                              "Service": "ec2.amazonaws.com"
+                          },
+                          "Action": "sts:AssumeRole"
+                      }
+                  ]
+              }
+              
+              try:
+                  # Check if role exists
+                  try:
+                      role_response = iam.get_role(RoleName=role_name)
+                      print(f"IAM role {role_name} already exists")
+                      role_arn = role_response['Role']['Arn']
+                  except iam.exceptions.NoSuchEntityException:
+                      # Create the IAM role
+                      print(f"Creating IAM role: {role_name}")
+                      role_response = iam.create_role(
+                          RoleName=role_name,
+                          AssumeRolePolicyDocument=json.dumps(trust_policy),
+                          Description='IAM role for EC2 instances created by Bedrock agent with SSM permissions'
+                      )
+                      role_arn = role_response['Role']['Arn']
+                      
+                      # Attach the AWS managed SSM policy (adjust ARN for GovCloud if needed)
+                      try:
+                          # Try GovCloud ARN format first
+                          govcloud_policy_arn = 'arn:aws-us-gov:iam::aws:policy/AmazonSSMManagedInstanceCore'
+                          iam.attach_role_policy(
+                              RoleName=role_name,
+                              PolicyArn=govcloud_policy_arn
+                          )
+                          print(f"Attached AmazonSSMManagedInstanceCore policy (GovCloud) to {role_name}")
+                      except Exception as govcloud_error:
+                          print(f"GovCloud policy attach failed: {govcloud_error}, trying standard AWS policy...")
+                          try:
+                              # Fall back to standard AWS policy ARN
+                              standard_policy_arn = 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+                              iam.attach_role_policy(
+                                  RoleName=role_name,
+                                  PolicyArn=standard_policy_arn
+                              )
+                              print(f"Attached AmazonSSMManagedInstanceCore policy (standard) to {role_name}")
+                          except Exception as standard_error:
+                              print(f"Both policy attach attempts failed: GovCloud={govcloud_error}, Standard={standard_error}")
+                              raise Exception(f"Failed to attach SSM policy: {standard_error}")
+                  
+                  # Check if instance profile exists
+                  try:
+                      profile_response = iam.get_instance_profile(InstanceProfileName=instance_profile_name)
+                      print(f"Instance profile {instance_profile_name} already exists")
+                      instance_profile_arn = profile_response['InstanceProfile']['Arn']
+                      
+                      # Check if role is attached to instance profile
+                      if not any(role['RoleName'] == role_name for role in profile_response['InstanceProfile']['Roles']):
+                          print(f"Adding role {role_name} to instance profile")
+                          iam.add_role_to_instance_profile(
+                              InstanceProfileName=instance_profile_name,
+                              RoleName=role_name
+                          )
+                          
+                  except iam.exceptions.NoSuchEntityException:
+                      # Create the instance profile
+                      print(f"Creating instance profile: {instance_profile_name}")
+                      profile_response = iam.create_instance_profile(
+                          InstanceProfileName=instance_profile_name,
+                          Path='/'
+                      )
+                      instance_profile_arn = profile_response['InstanceProfile']['Arn']
+                      
+                      # Add role to instance profile
+                      iam.add_role_to_instance_profile(
+                          InstanceProfileName=instance_profile_name,
+                          RoleName=role_name
+                      )
+                      print(f"Added role {role_name} to instance profile {instance_profile_name}")
+                  
+                  # Ensure we have an instance profile ARN before returning
+                  if not instance_profile_arn:
+                      raise Exception("Failed to create or retrieve instance profile ARN")
+                      
+                  print(f"Successfully got instance profile ARN: {instance_profile_arn}")
+                  return instance_profile_arn
+                  
+              except Exception as e:
+                  print(f"Error in get_or_create_ssm_instance_role: {str(e)}")
+                  raise Exception(f"IAM role/profile creation failed: {str(e)}")
+
+          def create_success_response(event, response_body, subnet_id=None, vpc_id=None):
+              """Create a properly formatted success response for Bedrock agent"""
+              session_attributes = event.get("sessionAttributes", {})
+              
+              # Store important info in session attributes for future requests
+              if subnet_id:
+                  session_attributes["subnetId"] = subnet_id
+                  session_attributes["privateSubnetId"] = subnet_id
+              if vpc_id:
+                  session_attributes["vpcId"] = vpc_id
+              
+              api_response = {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event["actionGroup"],
+                      "apiPath": event["apiPath"],
+                      "httpMethod": event["httpMethod"],
+                      "httpStatusCode": 200,
+                      "responseBody": {
+                          "application/json": {
+                              "body": json.dumps(response_body)
+                          }
+                      }
+                  },
+                  "sessionAttributes": session_attributes,
+                  "promptSessionAttributes": event.get("promptSessionAttributes", {})
+              }
+              
+              print("Final API Response:", json.dumps(api_response))
+              return api_response
+
+          def create_error_response(event, status_code, message):
+              """Create a properly formatted error response for Bedrock agent"""
+              error_body = {
+                  "statusCode": status_code,
+                  "message": message
+              }
+              
+              api_response = {
+                  "messageVersion": "1.0",
+                  "response": {
+                      "actionGroup": event["actionGroup"],
+                      "apiPath": event["apiPath"],
+                      "httpMethod": event["httpMethod"],
+                      "httpStatusCode": status_code,
+                      "responseBody": {
+                          "application/json": {
+                              "body": json.dumps(error_body)
+                          }
+                      }
+                  },
+                  "sessionAttributes": event.get("sessionAttributes", {}),
+                  "promptSessionAttributes": event.get("promptSessionAttributes", {})
+              }
+              
+              print("Error API Response:", json.dumps(api_response))
+              return api_response
+
+  # Agent Resource with Action Groups added
+  AgentResource:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Ref AgentName
+      AgentResourceRoleArn: !GetAtt AmazonBedrockExecutionRoleForAgentsQA.Arn
+      AutoPrepare: true
+      FoundationModel: "anthropic.claude-3-5-sonnet-20240620-v1:0"
+      Instruction: |
+        You are a cloud infrastructure assistant with expertise in AWS best practices. Your job is to assist users by creating AWS resources they request. This includes resources like VPCs, subnets, EC2 instances, security groups, S3 buckets, and other cloud infrastructure components. You can follow user-provided parameters such as CIDRs, instance types, subnet IDs, and security groups to provision these resources.
+
+        When asked to create a resource, make sure you gather the necessary details from the user (e.g., CIDR blocks, instance types, security groups) and generate the required AWS resource accordingly. If the user asks for multiple resources (like EC2 instances and subnets), ensure you create them sequentially or according to the provided instructions.
+
+        Additionally, if the user needs to configure endpoints (like SSM or EC2 endpoints), make sure to create them in the correct availability zone and attach the appropriate security groups and network configurations.
+
+      Description: "This agent can create AWS resources like VPCs, EC2 instances, subnets, security groups, and more based on user requests."
+      IdleSessionTTLInSeconds: 900
+      MemoryConfiguration:
+        SessionSummaryConfiguration: 
+          MaxRecentSessions: 10
+        StorageDays: 20
+      KnowledgeBases:
+        - KnowledgeBaseId: !Ref KnowledgeBaseWithAoss
+          Description: !Ref KnowledgeBaseDescription
+          KnowledgeBaseState: ENABLED
+      ActionGroups:
+        - ActionGroupName: "CreateVPC"
+          Description: "Create a VPC with a user-provided CIDR block"
+          ActionGroupExecutor:
+            Lambda: !GetAtt CreateVPCFunction.Arn
+          ApiSchema:
+            Payload: |
+              {
+                "openapi": "3.0.0",
+                "info": { "title": "VPC Creation API", "version": "1.0.0" },
+                "paths": {
+                  "/create-vpc": {
+                    "post": {
+                      "operationId": "CreateVPC",
+                      "description": "Creates a VPC with an optional name tag",
+                      "requestBody": {
+                        "content": {
+                          "application/json": {
+                            "schema": {
+                              "type": "object",
+                              "properties": {
+                                "cidrBlock": { "type": "string" },
+                                "vpcName": { "type": "string" }
+                              },
+                              "required": ["cidrBlock"]
+                            }
+                          }
+                        }
+                      },
+                      "responses": {
+                        "200": {
+                          "description": "VPC created successfully",
+                          "content": {
+                            "application/json": {
+                              "schema": {
+                                "type": "object",
+                                "properties": {
+                                  "vpcId": { "type": "string" },
+                                  "message": { "type": "string" }
+                                },
+                                "required": ["vpcId", "message"]
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+        - ActionGroupName: "CreateVPCComponents"
+          Description: "Create public and private subnets in a VPC"
+          ActionGroupExecutor:
+            Lambda: !GetAtt CreateVPCComponentsFunction.Arn
+          ApiSchema:
+            Payload: |
+              {
+                "openapi": "3.0.0",
+                "info": { "title": "Subnet and VPC Component Creation API", "version": "1.0.0" },
+                "paths": {
+                  "/create-subnet": {
+                    "post": {
+                      "operationId": "CreateVPCComponents",
+                      "description": "Creates subnets, IGW, NAT, route tables, and optionally endpoints",
+                      "requestBody": {
+                        "content": {
+                          "application/json": {
+                            "schema": {
+                              "type": "object",
+                              "properties": {
+                                "vpcId": { "type": "string" },
+                                "cidrBlock": { "type": "string" },
+                                "availabilityZone": { "type": "string" },
+                                "publicSubnetName": { "type": "string" },
+                                "privateSubnetName": { "type": "string" }      
+                              },
+                              "required": ["vpcId", "cidrBlock", "availabilityZone"]
+                            }
+                          }
+                        }
+                      },
+                      "responses": {
+                        "200": { "description": "Components created successfully" }
+                      }
+                    }
+                  }
+                }
+              }
+        - ActionGroupName: "CreateEndpoints"
+          Description: "Create multiple endpoints (SSM, EC2)"
+          ActionGroupExecutor:
+            Lambda: !GetAtt CreateEndpointFunction.Arn
+          ApiSchema:
+            Payload: |
+              openapi: "3.0.0"
+              info:
+                title: "VPC Endpoint Creation API"
+                version: "1.0.0"
+              paths:
+                /create-endpoints:
+                  post:
+                    operationId: "CreateEndpoints"
+                    description: "Creates multiple VPC endpoints for AWS services and their security group"
+                    requestBody:
+                      content:
+                        application/json:
+                          schema:
+                            type: object
+                            properties:
+                              vpcCidr:
+                                type: string
+                                description: "The CIDR block of the VPC"
+                              vpcId:
+                                type: string
+                                description: "The VPC ID where resources will be created"
+                              availabilityZone:
+                                type: string
+                                description: "The availability zone for the resources"
+                              endpointRequests:
+                                type: array
+                                description: "List of VPC endpoints to create"
+                                items:
+                                  type: object
+                                  properties:
+                                    serviceName:
+                                      type: string
+                                      description: "The AWS service name for the VPC endpoint (e.g., com.amazonaws.us-gov-west-1.ssm)"
+                                    subnetId:
+                                      type: string
+                                      description: "The subnet ID where the VPC endpoint will be created"
+                                  required:
+                                    - serviceName
+                                    - subnetId
+                            required:
+                              - vpcCidr
+                              - vpcId
+                              - endpointRequests
+                    responses:
+                      "200":
+                        description: "VPC endpoints created successfully"
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                statusCode:
+                                  type: integer
+                                message:
+                                  type: string
+                                createdEndpoints:
+                                  type: array
+                                  items:
+                                    type: object
+                                    properties:
+                                      type:
+                                        type: string
+                                      endpointName:
+                                        type: string
+                                      endpointId:
+                                        type: string
+                                      serviceName:
+                                        type: string
+                                      message:
+                                        type: string
+                              required:
+                                - statusCode
+                                - message
+                                - createdEndpoints
+                      "400":
+                        description: "Bad request - missing required parameters"
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                statusCode:
+                                  type: integer
+                                message:
+                                  type: string
+                      "500":
+                        description: "Internal server error"
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                statusCode:
+                                  type: integer
+                                message:
+                                  type: string
+
+        - ActionGroupName: "CreateEC2Instance"
+          Description: "Launch an EC2 instance in a subnet"
+          ActionGroupExecutor:
+            Lambda: !GetAtt CreateEC2InstanceFunction.Arn
+          ApiSchema:
+            Payload: |
+              openapi: "3.0.0"
+              info:
+                title: "EC2 Launch API"
+                version: "2.0.0"
+                description: "Launches EC2 instances with automatic AMI selection and subnet memory"
+              paths:
+                /launch-ec2:
+                  post:
+                    operationId: "CreateEC2"
+                    description: "Launches an EC2 instance with the latest AMI for the specified OS type. Remembers subnet from previous operations."
+                    requestBody:
+                      content:
+                        application/json:
+                          schema:
+                            type: object
+                            properties:
+                              amiId:
+                                type: string
+                                description: "Specific AMI ID to use (optional - will auto-discover latest if not provided)"
+                                example: "ami-0abcdef1234567890"
+                              instanceType:
+                                type: string
+                                description: "EC2 instance type (e.g., t3.micro, t3.small, m5.large)"
+                                default: "t3.micro"
+                                example: "t3.micro"
+                              osType:
+                                type: string
+                                description: "Operating system type (used for auto-discovery if amiId not provided)"
+                                enum: ["linux", "windows"]
+                                default: "linux"
+                                example: "linux"
+                              subnetId:
+                                type: string
+                                description: "Subnet ID where the instance will be launched (optional if subnet was created previously)"
+                                example: "subnet-12345678"
+                              vpcId:
+                                type: string
+                                description: "VPC ID (optional if stored in session)"
+                                example: "vpc-12345678"
+                            required: []
+                    responses:
+                      "200":
+                        description: "EC2 instance launched successfully"
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                statusCode:
+                                  type: integer
+                                  example: 200
+                                message:
+                                  type: string
+                                  example: "EC2 instance i-1234567890abcdef0 created successfully"
+                                instanceId:
+                                  type: string
+                                  example: "i-1234567890abcdef0"
+                                privateIpAddress:
+                                  type: string
+                                  example: "10.10.1.100"
+                                instanceType:
+                                  type: string
+                                  example: "t3.micro"
+                                operatingSystem:
+                                  type: string
+                                  example: "Linux"
+                                amiId:
+                                  type: string
+                                  example: "ami-0abcdef1234567890"
+                                subnetId:
+                                  type: string
+                                  example: "subnet-12345678"
+                                securityGroupId:
+                                  type: string
+                                  example: "sg-12345678"
+                                iamInstanceProfile:
+                                  type: string
+                                  example: "BedrockEC2-SSM-InstanceProfile"
+                                ssmEnabled:
+                                  type: boolean
+                                  example: true
+                                connectionInfo:
+                                  type: string
+                                  example: "Use AWS Systems Manager Session Manager to connect to this instance securely through the AWS Console"
+                              required:
+                                - statusCode
+                                - message
+                                - instanceId
+                                - privateIpAddress
+                                - instanceType
+                                - operatingSystem
+                                - amiId
+                                - subnetId
+                                - securityGroupId
+                                - iamInstanceProfile
+                                - ssmEnabled
+                                - connectionInfo
+                      "400":
+                        description: "Bad request - missing required parameters"
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                statusCode:
+                                  type: integer
+                                message:
+                                  type: string
+                      "500":
+                        description: "Internal server error"
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                statusCode:
+                                  type: integer
+                                message:
+                                  type: string
+
+Outputs:
+  AgentId:
+    Description: ID of the created Bedrock Agent
+    Value: !Ref AgentResource
+  KnowledgeBaseId:
+    Description: ID of the Bedrock Knowledge Base
+    Value: !Ref KnowledgeBaseWithAoss
